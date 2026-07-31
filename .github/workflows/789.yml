@@ -1,0 +1,70 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-android
+
+      - name: Patch & fix resources
+        shell: powershell
+        run: |
+          $csproj = Get-ChildItem -Recurse -Filter "*.csproj" | Where-Object { 
+            (Get-Content $_.FullName -Raw) -match "UseMaui" 
+          } | Select-Object -First 1
+          $projDir = $csproj.DirectoryName
+          Write-Host "Found: $($csproj.FullName)"
+          "CSPROJ=$($csproj.FullName)" >> $env:GITHUB_ENV
+
+          # Patch: 删 Windows Condition TFM 行 + 收缩 RIDs
+          (Get-Content $csproj.FullName) | ForEach-Object {
+            if ($_ -match "IsOSPlatform.*windows") { return }
+            $_ -replace 'android-arm;android-arm64;android-x86;android-x64', 'android-arm64'
+          } | Set-Content $csproj.FullName
+
+          # 扫描所有 MauiImage/MauiSplashScreen .svg 引用，缺失则生成占位
+          $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>'
+          [regex]::Matches((Get-Content $csproj.FullName -Raw),
+            '(?:MauiImage|MauiSplashScreen)\s+Include="([^"]+)"') | ForEach-Object {
+            $rel = $_.Groups[1].Value -replace '\\','/'
+            $abs = Join-Path $projDir $rel
+            if (-not (Test-Path $abs)) {
+              $dir = Split-Path $abs -Parent
+              if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+              Set-Content -Path $abs -Value $svg
+              Write-Host "Created: $abs"
+            }
+          }
+          Write-Host "All resources fixed"
+
+      - name: Restore
+        run: dotnet restore $env:CSPROJ
+
+      - name: Build
+        run: dotnet build $env:CSPROJ -c Release -p:RuntimeIdentifier=android-arm64
+
+      - name: Publish
+        run: dotnet publish $env:CSPROJ -c Release -p:RuntimeIdentifier=android-arm64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenUtauMobile-arm64
+          path: |
+            **/bin/**/*.apk
+            !**/obj/**
+          if-no-files-found: error
