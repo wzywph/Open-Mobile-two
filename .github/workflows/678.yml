@@ -1,0 +1,53 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-android
+
+      - name: Patch csproj
+        shell: powershell
+        run: |
+          $csproj = "OpenUtauMobile/OpenUtauMobile.csproj"
+          (Get-Content $csproj) | ForEach-Object {
+            # 删掉 Windows 条件 TargetFrameworks 行
+            if ($_ -match "IsOSPlatform.*windows") { return }
+            # 删掉 MauiSplashScreen 引用
+            if ($_ -match "MauiSplashScreen.*Splash") { return }
+            # 四架构收缩为 arm64
+            $_ -replace 'android-arm;android-arm64;android-x86;android-x64', 'android-arm64'
+          } | Set-Content $csproj
+          Write-Host "csproj patched"
+
+      - name: Restore
+        run: dotnet restore OpenUtauMobile/OpenUtauMobile.csproj
+
+      - name: Build
+        run: dotnet build OpenUtauMobile/OpenUtauMobile.csproj -c Release -p:RuntimeIdentifier=android-arm64
+
+      - name: Publish
+        run: dotnet publish OpenUtauMobile/OpenUtauMobile.csproj -c Release -p:RuntimeIdentifier=android-arm64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenUtauMobile-arm64
+          path: |
+            **/bin/**/*.apk
+            !**/obj/**
+          if-no-files-found: error
