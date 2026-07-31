@@ -1,0 +1,72 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-android
+
+      - name: Patch csproj
+        shell: pwsh
+        run: |
+          $f = "OpenUtauMobile/OpenUtauMobile.csproj"
+          $lines = Get-Content $f
+          $new = @()
+          foreach ($l in $lines) {
+            if ($l.Contains("IsOSPlatform")) { continue }
+            $l = $l.Replace("android-arm;android-arm64;android-x86;android-x64", "android-arm64")
+            $new += $l
+          }
+          [System.IO.File]::WriteAllLines($f, $new)
+          Write-Host "Patched"
+
+      - name: Fix missing svg
+        shell: pwsh
+        run: |
+          $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>'
+          $dirs = @(
+            "OpenUtauMobile/Resources/Splash",
+            "OpenUtauMobile/Resources/Icons/dark"
+          )
+          foreach ($d in $dirs) {
+            if (-not (Test-Path $d)) { New-Item -Path $d -ItemType Directory -Force }
+            $files = Get-ChildItem "$d" -Filter "*.svg" -ErrorAction SilentlyContinue
+            if ($files.Count -eq 0) {
+              $fn = Join-Path $d "placeholder.svg"
+              Set-Content -Path $fn -Value $svg
+              Write-Host "Created $fn"
+            }
+          }
+          Write-Host "Done"
+
+      - name: Restore
+        run: dotnet restore OpenUtauMobile/OpenUtauMobile.csproj
+
+      - name: Build
+        run: dotnet build OpenUtauMobile/OpenUtauMobile.csproj -c Release -p:RuntimeIdentifier=android-arm64
+
+      - name: Publish
+        run: dotnet publish OpenUtauMobile/OpenUtauMobile.csproj -c Release -p:RuntimeIdentifier=android-arm64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenUtauMobile-arm64
+          path: |
+            **/bin/**/*.apk
+            !**/obj/**
+          if-no-files-found: error
