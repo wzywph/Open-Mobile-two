@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="OpenUtauMobile.Views.Controls.AiChatPopup"
+             Title="AI 编曲助手"
+             Shell.NavBarIsVisible="False">
+    <Grid RowDefinitions="Auto, *, Auto" Padding="10">
+        <!-- 标题栏 -->
+        <Grid ColumnDefinitions="*, Auto" Padding="5">
+            <Label Text="🤖 AI 编曲助手" FontSize="18" FontAttributes="Bold" VerticalOptions="Center"/>
+            <Button Grid.Column="1" Text="✕" FontSize="18" 
+                    BackgroundColor="Transparent" TextColor="{AppThemeBinding Light=Black, Dark=White}"
+                    Clicked="ButtonClose_Clicked" WidthRequest="40" HeightRequest="40"/>
+        </Grid>
+        
+        <!-- 消息列表 -->
+        <CollectionView x:Name="MessagesCollection" Grid.Row="1" 
+                         ItemsSource="{Binding Messages}" 
+                         Margin="0,5"
+                         VerticalOptions="Fill">
+            <CollectionView.ItemTemplate>
+                <DataTemplate>
+                    <Grid Padding="5,3">
+                        <Frame BackgroundColor="{Binding BubbleColor}" 
+                               CornerRadius="12" Padding="12,8"
+                               HasShadow="False"
+                               Margin="{Binding BubbleMargin}">
+                            <Label Text="{Binding Content}" 
+                                   TextColor="{Binding TextColor}"
+                                   FontSize="14"
+                                   LineBreakMode="WordWrap"/>
+                        </Frame>
+                    </Grid>
+                </DataTemplate>
+            </CollectionView.ItemTemplate>
+        </CollectionView>
+        
+        <!-- 输入区域 -->
+        <Grid Grid.Row="2" ColumnDefinitions="*, Auto" ColumnSpacing="8" Padding="0,8,0,0">
+            <Editor x:Name="InputEditor" Placeholder="输入编曲需求..." 
+                    HeightRequest="80" VerticalOptions="End"
+                    Text="{Binding InputText}"/>
+            <Button Grid.Column="1" Text="发送" 
+                    VerticalOptions="End" WidthRequest="60" HeightRequest="40"
+                    Clicked="ButtonSend_Clicked" 
+                    BackgroundColor="{AppThemeBinding Light=#0078D4, Dark=#0078D4}"
+                    TextColor="White" CornerRadius="8"/>
+        </Grid>
+        
+        <!-- 加载指示器 -->
+        <ActivityIndicator x:Name="LoadingIndicator" Grid.Row="1" 
+                           IsRunning="False" IsVisible="False"
+                           VerticalOptions="Center" HorizontalOptions="Center"
+                           HeightRequest="40" WidthRequest="40"
+                           Color="{AppThemeBinding Light=#0078D4, Dark=#0078D4}"/>
+    </Grid>
+</ContentPage>
