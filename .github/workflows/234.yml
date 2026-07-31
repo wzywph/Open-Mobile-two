@@ -1,0 +1,94 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-android
+
+      - name: Locate project file
+        id: findproj
+        shell: pwsh
+        run: |
+          $proj = Get-ChildItem -Path . -Recurse -Filter "OpenUtauMobile.csproj" | Select-Object -First 1
+          if ($null -eq $proj) {
+            Write-Host "❌ 找不到 OpenUtauMobile.csproj"
+            exit 1
+          }
+          Write-Host "✅ 找到: $($proj.FullName)"
+          echo "PROJ_PATH=$($proj.FullName)" >> $env:GITHUB_ENV
+
+      - name: Patch csproj + create missing SVG placeholders
+        shell: pwsh
+        run: |
+          $projPath = $env:PROJ_PATH
+          $projDir  = Split-Path -Parent $projPath
+          $content  = Get-Content -Path $projPath -Raw
+
+          # 1. 删除 Windows 条件 TFM 行
+          $content = $content -replace '(?m)^[^\r\n]*IsOSPlatform[^\r\n]*windows[^\r\n]*\r?\n', ''
+          Write-Host "✅ Windows TFM 行已删除（若存在）"
+
+          # 2. RuntimeIdentifiers 收缩为 arm64
+          if ($content -match 'android-arm;android-arm64') {
+            $content = $content -replace '<RuntimeIdentifiers>android-arm;android-arm64;android-x86;android-x64</RuntimeIdentifiers>',
+                                         '<RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>'
+            Write-Host "✅ RuntimeIdentifiers → arm64"
+          }
+
+          # 3. CopyOpenUtauAssets 加 iOS Condition（跳过 Android 时复制）
+          $old = '<Target Name="CopyOpenUtauAssets" AfterTargets="Build;Publish">'
+          $new = '<Target Name="CopyOpenUtauAssets" AfterTargets="Build;Publish" Condition="$([MSBuild]::GetTargetPlatformIdentifier(''$(TargetFramework)'')) == ''ios''">'
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Write-Host "✅ CopyOpenUtauAssets 已加 iOS Condition"
+          }
+
+          Set-Content -Path $projPath -Value $content -NoNewline
+
+          # 4. 扫描 csproj 里全部 SVG Include，对缺失文件创建占位 SVG
+          $minSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"></svg>'
+          $refs = [regex]::Matches($content, 'Include="([^"]+\.svg)"')
+          foreach ($m in $refs) {
+            $rel = $m.Groups[1].Value
+            # 跳过含通配符的行
+            if ($rel -match '[*?]') { continue }
+            $full = Join-Path $projDir $rel
+            if (-not (Test-Path $full)) {
+              $dir = Split-Path -Parent $full
+              if ($dir -and -not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+              }
+              Set-Content -Path $full -Value $minSvg
+              Write-Host "✅ 创建占位 SVG: $rel"
+            }
+          }
+          Write-Host "✅ SVG 占位检查完成"
+
+      - name: Restore
+        run: dotnet restore "${{ env.PROJ_PATH }}"
+
+      - name: Build APK
+        run: dotnet build "${{ env.PROJ_PATH }}" -c Release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenUtauMobile-apk
+          path: |
+            **/bin/**/*.apk
+            !**/obj/**
+          if-no-files-found: error
