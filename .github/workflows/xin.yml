@@ -1,0 +1,288 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+    
+    - name: Install MAUI workload
+      run: dotnet workload install maui-android
+    
+    - name: Locate project file
+      run: |
+        $csproj = Get-ChildItem -Recurse -Filter "OpenUtauMobile.csproj" | Select-Object -First 1
+        if (-not $csproj) { throw "OpenUtauMobile.csproj not found" }
+        echo "CSPROJ_PATH=$($csproj.FullName)" >> $env:GITHUB_ENV
+    
+    - name: Fix AI command thread safety
+      shell: pwsh
+      run: |
+        $file = "$env:GITHUB_WORKSPACE\\OpenUtauMobile\\ViewModels\\EditViewModel.cs"
+        $content = Get-Content $file -Raw -Encoding UTF8
+        
+        # 修复 ExecuteAddNotes - 包裹在主线程调用中
+        $oldAdd = @'
+private string ExecuteAddNotes(AiCommandAction action)
+        {
+            if (EditingPart == null)
+            {
+                return "请先选择一个分片（Part）后再执行添加音符操作。";
+            }
+            if (action.Notes == null || action.Notes.Count == 0)
+            {
+                return "未指定要添加的音符。";
+            }
+            int count = 0;
+            var notesToAdd = new List<UNote>();
+            foreach (var noteData in action.Notes)
+            {
+                int tone = noteData.Tone;
+                int position = noteData.Position;
+                int duration = noteData.Duration > 0 ? noteData.Duration : 480;
+                string lyric = !string.IsNullOrEmpty(noteData.Lyric) ? noteData.Lyric : "la";
+                // 使用 Project.CreateNote 创建带完整初始化的音符
+                UNote newNote = DocManager.Inst.Project.CreateNote(tone, position, duration);
+                newNote.lyric = lyric;
+                notesToAdd.Add(newNote);
+                count++;
+            }
+            // 必须通过命令系统添加音符，才能触发渲染/音素化/撤销/保存通知链
+            DocManager.Inst.StartUndoGroup();
+            DocManager.Inst.ExecuteCmd(new AddNoteCommand(EditingPart, notesToAdd));
+            DocManager.Inst.EndUndoGroup();
+'@
+        
+        $newAdd = @'
+private string ExecuteAddNotes(AiCommandAction action)
+        {
+            if (EditingPart == null)
+            {
+                return "请先选择一个分片（Part）后再执行添加音符操作。";
+            }
+            if (action.Notes == null || action.Notes.Count == 0)
+            {
+                return "未指定要添加的音符。";
+            }
+            int count = 0;
+            var notesToAdd = new List<UNote>();
+            foreach (var noteData in action.Notes)
+            {
+                int tone = noteData.Tone;
+                int position = noteData.Position;
+                int duration = noteData.Duration > 0 ? noteData.Duration : 480;
+                string lyric = !string.IsNullOrEmpty(noteData.Lyric) ? noteData.Lyric : "la";
+                // 使用 Project.CreateNote 创建带完整初始化的音符
+                UNote newNote = DocManager.Inst.Project.CreateNote(tone, position, duration);
+                newNote.lyric = lyric;
+                notesToAdd.Add(newNote);
+                count++;
+            }
+            // 必须在主线程执行命令，确保渲染正确触发
+            MainThread.InvokeOnMainThreadAsync(() => {
+                DocManager.Inst.StartUndoGroup();
+                DocManager.Inst.ExecuteCmd(new AddNoteCommand(EditingPart, notesToAdd));
+                DocManager.Inst.EndUndoGroup();
+            }).Wait();
+'@
+        
+        $content = $content.Replace($oldAdd, $newAdd)
+        
+        # 修复 ExecuteRemoveNotes - 清空所有音符分支
+        $oldRemove1 = @'
+            if (action.ClearAll == true)
+            {
+                int count = EditingPart.notes.Count;
+                var allNotes = new List<UNote>(EditingPart.notes);
+                DocManager.Inst.StartUndoGroup();
+                DocManager.Inst.ExecuteCmd(new RemoveNoteCommand(EditingPart, allNotes));
+                DocManager.Inst.EndUndoGroup();
+'@
+        
+        $newRemove1 = @'
+            if (action.ClearAll == true)
+            {
+                int count = EditingPart.notes.Count;
+                var allNotes = new List<UNote>(EditingPart.notes);
+                MainThread.InvokeOnMainThreadAsync(() => {
+                    DocManager.Inst.StartUndoGroup();
+                    DocManager.Inst.ExecuteCmd(new RemoveNoteCommand(EditingPart, allNotes));
+                    DocManager.Inst.EndUndoGroup();
+                }).Wait();
+'@
+        
+        $content = $content.Replace($oldRemove1, $newRemove1)
+        
+        # 修复 ExecuteRemoveNotes - 按索引删除分支
+        $oldRemove2 = @'
+                // 通过命令系统删除
+                DocManager.Inst.StartUndoGroup();
+                DocManager.Inst.ExecuteCmd(new RemoveNoteCommand(EditingPart, notesToRemove));
+                DocManager.Inst.EndUndoGroup();
+'@
+        
+        $newRemove2 = @'
+                // 通过命令系统删除（主线程）
+                MainThread.InvokeOnMainThreadAsync(() => {
+                    DocManager.Inst.StartUndoGroup();
+                    DocManager.Inst.ExecuteCmd(new RemoveNoteCommand(EditingPart, notesToRemove));
+                    DocManager.Inst.EndUndoGroup();
+                }).Wait();
+'@
+        
+        $content = $content.Replace($oldRemove2, $newRemove2)
+        
+        # 修复 ExecuteRemoveNotes - 按音高位置匹配删除（在 return 前）
+        $oldRemove3 = @'
+            }
+            DocManager.Inst.StartUndoGroup();
+            DocManager.Inst.ExecuteCmd(new RemoveNoteCommand(EditingPart, notesToRemove));
+            DocManager.Inst.EndUndoGroup();
+            return $"✅ 已删除 {count} 个匹配的音符。";
+'@
+        
+        $newRemove3 = @'
+            }
+            MainThread.InvokeOnMainThreadAsync(() => {
+                DocManager.Inst.StartUndoGroup();
+                DocManager.Inst.ExecuteCmd(new RemoveNoteCommand(EditingPart, notesToRemove));
+                DocManager.Inst.EndUndoGroup();
+            }).Wait();
+            return $"✅ 已删除 {count} 个匹配的音符。";
+'@
+        
+        $content = $content.Replace($oldRemove3, $newRemove3)
+        
+        # 修复 ExecuteModifyNotes - 批量修改
+        $oldModify1 = @'
+            }
+            DocManager.Inst.StartUndoGroup();
+            foreach (var mod in action.Modifications)
+'@
+        
+        $newModify1 = @'
+            }
+            MainThread.InvokeOnMainThreadAsync(() => {
+                DocManager.Inst.StartUndoGroup();
+            }).Wait();
+            foreach (var mod in action.Modifications)
+'@
+        
+        $content = $content.Replace($oldModify1, $newModify1)
+        
+        # 修复 ExecuteModifyNotes - EndUndoGroup
+        $oldModify2 = @'
+                }
+            }
+            DocManager.Inst.EndUndoGroup();
+            return $"✅ 已修改 {count} 个音符的属性。";
+'@
+        
+        $newModify2 = @'
+                }
+            }
+            MainThread.InvokeOnMainThreadAsync(() => {
+                DocManager.Inst.EndUndoGroup();
+            }).Wait();
+            return $"✅ 已修改 {count} 个音符的属性。";
+'@
+        
+        $content = $content.Replace($oldModify2, $newModify2)
+        
+        $content | Set-Content $file -Encoding UTF8 -NoNewline
+        Write-Host "Fixed AI command thread safety"
+    
+    - name: Fix Preferences ambiguity
+      shell: pwsh
+      run: |
+        $file = "$env:GITHUB_WORKSPACE\\OpenUtauMobile\\ViewModels\\EditViewModel.cs"
+        $content = Get-Content $file -Raw -Encoding UTF8
+        if ($content -notmatch 'using Preferences = OpenUtau\\.Core\\.Util\\.Preferences;') {
+          $content = $content -replace '(using ReactiveUI;)', "`$1`r`nusing Preferences = OpenUtau.Core.Util.Preferences;"
+          $content | Set-Content $file -Encoding UTF8 -NoNewline
+          Write-Host "Added Preferences alias"
+        }
+    
+    - name: Fix SortedSet index access
+      shell: pwsh
+      run: |
+        $file = "$env:GITHUB_WORKSPACE\\OpenUtauMobile\\ViewModels\\EditViewModel.cs"
+        $content = Get-Content $file -Raw -Encoding UTF8
+        $content = $content -replace 'SelectedNotes\\[0\\]', 'SelectedNotes.First()'
+        $content | Set-Content $file -Encoding UTF8 -NoNewline
+        Write-Host "Fixed SortedSet indexing"
+    
+    - name: Clean stray AI control tokens
+      shell: pwsh
+      run: |
+        $file = "$env:GITHUB_WORKSPACE\\OpenUtauMobile\\ViewModels\\EditViewModel.cs"
+        $content = Get-Content $file -Raw -Encoding UTF8
+        $content = $content -replace '<\\|im_end\\|>', ''
+        $content | Set-Content $file -Encoding UTF8 -NoNewline
+        Write-Host "Cleaned AI control tokens"
+    
+    - name: Patch main csproj
+      shell: pwsh
+      run: |
+        $csproj = "$env:GITHUB_WORKSPACE\\OpenUtauMobile\\OpenUtauMobile.csproj"
+        $xml = [xml](Get-Content $csproj -Raw)
+        $changed = $false
+        foreach ($pg in $xml.Project.PropertyGroup) {
+          if ($pg.ApplicationId -eq 'com.companyname.openutaumobile') {
+            $pg.ApplicationId = 'pers.vocoder712.openutaumobile'
+            $changed = $true
+          }
+        }
+        if ($changed) { $xml.Save($csproj) }
+        Write-Host "Patched ApplicationId"
+    
+    - name: Create missing SVG placeholders
+      shell: pwsh
+      run: |
+        $svgDir = "$env:GITHUB_WORKSPACE\\OpenUtauMobile\\Resources\\Images"
+        $placeholder = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"></svg>'
+        @('folder', 'file', 'note') | ForEach-Object {
+          $path = Join-Path $svgDir "$_.svg"
+          if (-not (Test-Path $path)) {
+            New-Item -ItemType Directory -Force -Path $svgDir | Out-Null
+            $placeholder | Out-File $path -Encoding UTF8
+            Write-Host "Created placeholder: $_.svg"
+          }
+        }
+    
+    - name: Restore
+      run: dotnet restore "$env:CSPROJ_PATH"
+    
+    - name: Build APK
+      run: |
+        dotnet build "$env:CSPROJ_PATH" `
+          -c Release `
+          -p:AndroidPackageFormats=apk `
+          -p:AndroidKeyStore=false `
+          | Tee-Object -FilePath build_log.txt
+    
+    - name:Upload build log
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: build-log
+        path: build_log.txt
+        if-no-files-found: error
+    
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: openutau-mobile-apk
+        path: "**/*-Signed.apk"
+        if-no-files-found: error
