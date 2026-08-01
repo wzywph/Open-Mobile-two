@@ -1,0 +1,338 @@
+        run: |
+          if ($null -eq $env:OP_PATH) {
+            Write-Host "[Patch 3] 未找到 ObjectProvider.cs，跳过"
+          } else {
+            $path = $env:OP_PATH
+            $content = Get-Content -Path $path -Raw
+            $linePattern = '(?m)^[^\r\n]*DocManager\.Inst\.ExecuteCmd\(new ErrorMessageNotification\([^\r\n]*\)\);\r?\n'
+            if ($content -match $linePattern) {
+              $content = [regex]::Replace($content, $linePattern, '')
+              Set-Content -Path $path -Value $content -NoNewline
+              Write-Host "[Patch 3] 已删除过早调用 DocManager.ExecuteCmd 的那一行，修复启动崩溃"
+            } else {
+              Write-Host "[Patch 3] 未发现需要修补的内容（可能已修过），跳过"
+            }
+          }
+
+      # ===================================================================
+      # 补丁 4：DeepSeekService.cs 里 Preferences 类型和 MAUI 自带的
+      # Preferences 类同名冲突，加显式别名消除歧义；
+      # 同时把 ParseCommands 解析失败时直接抛异常，改成优雅兜底
+      # （当作纯文字消息处理，不再报错中断），避免AI回复格式稍有偏差
+      # 就直接报错、无法给用户任何有意义的反馈。
+      # ===================================================================
+      - name: Patch 4 - Fix DeepSeekService.cs (Preferences ambiguity + graceful JSON fallback)
+        shell: pwsh
+        run: |
+          if ($null -eq $env:DSS_PATH) {
+            Write-Host "[Patch 4] 未找到 DeepSeekService.cs，跳过"
+          } else {
+            $path = $env:DSS_PATH
+            $content = Get-Content -Path $path -Raw
+            $content = $content -replace "`r`n", "`n"
+            $changed = $false
+
+            # 4a. Preferences 别名
+            if ($content -match 'using OpenUtau\.Core\.Util;' -and $content -notmatch 'using Preferences = OpenUtau\.Core\.Util\.Preferences;') {
+              $content = $content -replace 'using OpenUtau\.Core\.Util;', "using OpenUtau.Core.Util;`nusing Preferences = OpenUtau.Core.Util.Preferences;"
+              Write-Host "[Patch 4a] 已添加 Preferences 别名"
+              $changed = $true
+            }
+
+            # 4b. ParseCommands 优雅降级（不再抛异常）
+            $oldLines = @(
+              '            try {',
+              '                return JsonSerializer.Deserialize<AiCommandRoot>(jsonText);',
+              '            } catch (Exception ex) {',
+              '                throw new FormatException($"AI 返回的不是有效指令 JSON：{reply}", ex);',
+              '            }'
+            )
+            $old = [string]::Join("`n", $oldLines)
+            if ($content.Contains($old)) {
+              $newLines = @(
+                '            try {',
+                '                var result = JsonSerializer.Deserialize<AiCommandRoot>(jsonText, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });',
+                '                if (result != null && result.Actions != null && result.Actions.Count > 0) {',
+                '                    return result;',
+                '                }',
+                '            } catch {',
+                '                // 解析失败时不再抛异常，走下面的兜底逻辑',
+                '            }',
+                '            return new AiCommandRoot {',
+                '                Actions = new System.Collections.Generic.List<AiCommandAction> {',
+                '                    new AiCommandAction { Type = "message" }',
+                '                },',
+                '                Message = reply',
+                '            };'
+              )
+              $new = [string]::Join("`n", $newLines)
+              $content = $content.Replace($old, $new)
+              Write-Host "[Patch 4b] ParseCommands 已改为优雅降级，不再抛异常"
+              $changed = $true
+            }
+
+            if ($changed) {
+              Set-Content -Path $path -Value $content -NoNewline
+            } else {
+              Write-Host "[Patch 4] 未发现需要修补的内容（可能已修过），跳过"
+            }
+          }
+
+      # ===================================================================
+      # 补丁 5：EditViewModel.cs 里 EditingPart.notes 实际类型是 SortedSet
+      # （自动排序集合），不支持 notes[索引] 这种下标访问方式，
+      # 之前AI改音符功能把它当成普通List来用了，编译直接报错。
+      # 统一替换成 .ElementAt(索引) 这种兼容写法。
+      # ===================================================================
+      - name: Patch 5 - Fix SortedSet indexing in EditViewModel.cs
+        shell: pwsh
+        run: |
+          if ($null -eq $env:EVM_PATH) {
+            Write-Host "[Patch 5] 未找到 EditViewModel.cs，跳过"
+          } else {
+            $path = $env:EVM_PATH
+            $content = Get-Content -Path $path -Raw
+            $pattern = 'EditingPart\.notes\[([^\]]+)\]'
+            $matches = [regex]::Matches($content, $pattern)
+            if ($matches.Count -gt 0) {
+              $content = [regex]::Replace($content, $pattern, 'EditingPart.notes.ElementAt($1)')
+              Set-Content -Path $path -Value $content -NoNewline
+              Write-Host "[Patch 5] 已修复 $($matches.Count) 处 SortedSet 下标访问"
+            } else {
+              Write-Host "[Patch 5] 未发现需要修补的内容（可能已修过），跳过"
+            }
+          }
+
+      # ===================================================================
+      # 补丁 6：EditViewModel.cs 里 ExecuteAiCommand 外层多包了一层
+      # StartUndoGroup/EndUndoGroup，跟每个具体操作自己内部那层嵌套冲突，
+      # 导致外层的 EndUndoGroup 执行时撤销组已经被内层提前结束，
+      # 触发渲染的通知因此丢失——AI加的音符能看见但不会被渲染成音频。
+      # 去掉外层这层包裹，并强制加一道校验+渲染兜底。
+      # ===================================================================
+      - name: Patch 6 - Fix AI note rendering (nested UndoGroup)
+        shell: pwsh
+        run: |
+          if ($null -eq $env:EVM_PATH) {
+            Write-Host "[Patch 6] 未找到 EditViewModel.cs，跳过"
+          } else {
+            $path = $env:EVM_PATH
+            $content = Get-Content -Path $path -Raw
+            $content = $content -replace "`r`n", "`n"
+
+            $oldLines = @(
+              '                var resultMessages = new System.Text.StringBuilder();',
+              '                DocManager.Inst.StartUndoGroup();',
+              '',
+              '                foreach (var action in root.Actions)',
+              '                {',
+              '                    string actionResult = await ExecuteSingleAction(action);',
+              '                    resultMessages.AppendLine(actionResult);',
+              '                }',
+              '',
+              '                DocManager.Inst.EndUndoGroup();'
+            )
+            $old = [string]::Join("`n", $oldLines)
+
+            if ($content.Contains($old)) {
+              $newLines = @(
+                '                var resultMessages = new System.Text.StringBuilder();',
+                '',
+                '                foreach (var action in root.Actions)',
+                '                {',
+                '                    string actionResult = await ExecuteSingleAction(action);',
+                '                    resultMessages.AppendLine(actionResult);',
+                '                }',
+                '',
+                '                // 每个 action 内部已自行管理 UndoGroup，这里不再重复包一层。',
+                '                DocManager.Inst.Project.ValidateFull();',
+                '                DocManager.Inst.ExecuteCmd(new global::OpenUtau.Core.PreRenderNotification());'
+              )
+              $new = [string]::Join("`n", $newLines)
+              $content = $content.Replace($old, $new)
+              Write-Host "[Patch 6] 已修复嵌套 UndoGroup 导致渲染丢失的问题"
+            } else {
+              Write-Host "[Patch 6] 未发现需要修补的内容（可能已修过或结构有变化），跳过"
+            }
+            Set-Content -Path $path -Value $content -NoNewline
+          }
+
+      # ===================================================================
+      # 补丁 7：给缺失的图标 SVG 文件补占位符（内容非空，避免图标光栅化
+      # 工具处理"空文档"时崩溃），确保编译不会因为找不到资源文件而失败。
+      # ===================================================================
+      - name: Patch 7 - Create missing SVG placeholders
+        shell: pwsh
+        run: |
+          $minSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="3" fill="#888888"/></svg>'
+          $allProjs = Get-ChildItem -Path . -Recurse -Filter "*.csproj"
+          foreach ($proj in $allProjs) {
+            $projContent = Get-Content -Path $proj.FullName -Raw
+            $projDir     = Split-Path -Parent $proj.FullName
+            $refs = [regex]::Matches($projContent, '(?:Include|ForegroundFile)="([^"]+\.svg)"')
+            foreach ($m in $refs) {
+              $rel = $m.Groups[1].Value
+              if ($rel -match '[*?]') { continue }
+              $full = Join-Path $projDir $rel
+              if (-not (Test-Path $full)) {
+                $dir = Split-Path -Parent $full
+                if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                Set-Content -Path $full -Value $minSvg -NoNewline
+              }
+            }
+          }
+          Write-Host "[Patch 7] 图标占位检查完成"
+
+      # ===================================================================
+      # 补丁 8：DeepSeekService.cs 里 AI 对话每次请求只发 system + 当前这一条
+      # 消息，模型完全没有上下文记忆，"改上面的"这种指令永远失效；
+      # 另外超时时间只有 60 秒，生成一整首歌的大段 JSON 经常来不及就超时。
+      # 这里加一个内存里的对话历史列表（保留最近 20 条，避免请求体无限增长），
+      # 每次请求把历史一起带上；并把超时时间从 60 秒放宽到 600 秒（10 分钟），
+      # MaxTokens 从 4096 提到 8192，减少大段 JSON 被截断/生成不完超时的概率。
+      # ===================================================================
+      - name: Patch 8 - Fix DeepSeekService.cs (no conversation history + 60s timeout)
+        shell: pwsh
+        run: |
+          if ($null -eq $env:DSS_PATH) {
+            Write-Host "[Patch 8] 未找到 DeepSeekService.cs，跳过"
+          } else {
+            $path = $env:DSS_PATH
+            $content = Get-Content -Path $path -Raw
+            $content = $content -replace "`r`n", "`n"
+            $changed = $false
+
+            # 8a. 增加历史消息字段 + 超时从 60 秒放宽到 600 秒
+            $oldA = [string]::Join("`n", @(
+              '        private readonly HttpClient _httpClient;',
+              '',
+              '        private DeepSeekService() {',
+              '            _httpClient = new HttpClient();',
+              '            _httpClient.Timeout = TimeSpan.FromSeconds(60);',
+              '        }'
+            ))
+            if ($content.Contains($oldA)) {
+              $newA = [string]::Join("`n", @(
+                '        private readonly HttpClient _httpClient;',
+                '        private readonly System.Collections.Generic.List<DeepSeekMessage> _history = new System.Collections.Generic.List<DeepSeekMessage>();',
+                '        private const int MaxHistoryMessages = 20;',
+                '',
+                '        private DeepSeekService() {',
+                '            _httpClient = new HttpClient();',
+                '            _httpClient.Timeout = TimeSpan.FromSeconds(600);',
+                '        }',
+                '',
+                '        /// <summary>',
+                '        /// 清空对话历史，开始一轮新的上下文（比如用户点了"新对话"）。',
+                '        /// </summary>',
+                '        public void ClearHistory() {',
+                '            _history.Clear();',
+                '        }'
+              ))
+              $content = $content.Replace($oldA, $newA)
+              Write-Host "[Patch 8a] 已加对话历史字段，超时 60s -> 600s"
+              $changed = $true
+            } else {
+              Write-Host "[Patch 8a] 未发现需要修补的内容（可能已修过），跳过"
+            }
+
+            # 8b. 请求里带上历史消息，MaxTokens 4096 -> 8192
+            $oldB = [string]::Join("`n", @(
+              '            var request = new DeepSeekChatRequest {',
+              '                Model = model,',
+              '                Messages = new System.Collections.Generic.List<DeepSeekMessage> {',
+              '                    new DeepSeekMessage { Role = "system", Content = GetFullSystemPrompt() },',
+              '                    new DeepSeekMessage { Role = "user", Content = userMessage }',
+              '                },',
+              '                Temperature = 0.7,',
+              '                MaxTokens = 4096',
+              '            };'
+            ))
+            if ($content.Contains($oldB)) {
+              $newB = [string]::Join("`n", @(
+                '            var messages = new System.Collections.Generic.List<DeepSeekMessage> {',
+                '                new DeepSeekMessage { Role = "system", Content = GetFullSystemPrompt() }',
+                '            };',
+                '            messages.AddRange(_history);',
+                '            messages.Add(new DeepSeekMessage { Role = "user", Content = userMessage });',
+                '',
+                '            var request = new DeepSeekChatRequest {',
+                '                Model = model,',
+                '                Messages = messages,',
+                '                Temperature = 0.7,',
+                '                MaxTokens = 8192',
+                '            };'
+              ))
+              $content = $content.Replace($oldB, $newB)
+              Write-Host "[Patch 8b] 请求已带上历史消息，MaxTokens 4096 -> 8192"
+              $changed = $true
+            } else {
+              Write-Host "[Patch 8b] 未发现需要修补的内容（可能已修过），跳过"
+            }
+
+            # 8c. 请求成功后把这一轮存进历史，并限制历史长度
+            $oldC = [string]::Join("`n", @(
+              '            return reply;',
+              '        }',
+              '',
+              '        /// <summary>',
+              '        /// 解析 AI 回复中的编曲指令',
+              '        /// </summary>'
+            ))
+            if ($content.Contains($oldC)) {
+              $newC = [string]::Join("`n", @(
+                '            _history.Add(new DeepSeekMessage { Role = "user", Content = userMessage });',
+                '            _history.Add(new DeepSeekMessage { Role = "assistant", Content = reply });',
+                '            while (_history.Count > MaxHistoryMessages) {',
+                '                _history.RemoveAt(0);',
+                '            }',
+                '',
+                '            return reply;',
+                '        }',
+                '',
+                '        /// <summary>',
+                '        /// 解析 AI 回复中的编曲指令',
+                '        /// </summary>'
+              ))
+              $content = $content.Replace($oldC, $newC)
+              Write-Host "[Patch 8c] 已加对话历史写入逻辑"
+              $changed = $true
+            } else {
+              Write-Host "[Patch 8c] 未发现需要修补的内容（可能已修过），跳过"
+            }
+
+            if ($changed) {
+              Set-Content -Path $path -Value $content -NoNewline
+            }
+          }
+
+      - name: Restore
+        run: dotnet restore "${{ env.PROJ_PATH }}"
+
+      - name: Build APK
+        shell: pwsh
+        run: |
+          dotnet build "${{ env.PROJ_PATH }}" -f net9.0-android -c Release *>&1 |
+            Tee-Object -FilePath build_log.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "构建失败，退出码 $LASTEXITCODE，完整日志见 build_log.txt 附件"
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload build log (always, even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_log.txt
+          if-no-files-found: warn
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenUtauMobile-apk
+          path: |
+            **/bin/**/*.apk
+            !**/obj/**
+          if-no-files-found: error
