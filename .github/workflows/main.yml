@@ -1,0 +1,315 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-android
+
+      - name: Locate project files
+        shell: pwsh
+        run: |
+          $proj = Get-ChildItem -Path . -Recurse -Filter "OpenUtauMobile.csproj" | Select-Object -First 1
+          if ($null -eq $proj) {
+            Write-Host "找不到 OpenUtauMobile.csproj"
+            exit 1
+          }
+          Write-Host "找到项目: $($proj.FullName)"
+          echo "PROJ_PATH=$($proj.FullName)" >> $env:GITHUB_ENV
+
+          $evm = Get-ChildItem -Path . -Recurse -Filter "EditViewModel.cs" | Select-Object -First 1
+          if ($null -ne $evm) { echo "EVM_PATH=$($evm.FullName)" >> $env:GITHUB_ENV }
+
+          $dss = Get-ChildItem -Path . -Recurse -Filter "DeepSeekService.cs" | Select-Object -First 1
+          if ($null -ne $dss) { echo "DSS_PATH=$($dss.FullName)" >> $env:GITHUB_ENV }
+
+          $op = Get-ChildItem -Path . -Recurse -Filter "ObjectProvider.cs" | Select-Object -First 1
+          if ($null -ne $op) { echo "OP_PATH=$($op.FullName)" >> $env:GITHUB_ENV }
+
+      # ===================================================================
+      # 补丁 1：清理AI生成代码里混入的特殊控制符号乱码（如 <｜...｜> ）
+      # ===================================================================
+      - name: Patch 1 - Clean stray AI control tokens
+        shell: pwsh
+        run: |
+          $pattern = '<\/?｜[^>]*>'
+          $files = Get-ChildItem -Path . -Recurse -Filter "*.cs" -File
+          $fixedCount = 0
+          foreach ($f in $files) {
+            $text = Get-Content -Path $f.FullName -Raw -ErrorAction SilentlyContinue
+            if ($null -ne $text -and $text -match $pattern) {
+              $newText = [regex]::Replace($text, $pattern, '')
+              Set-Content -Path $f.FullName -Value $newText -NoNewline
+              Write-Host "清理乱码: $($f.FullName)"
+              $fixedCount++
+            }
+          }
+          Write-Host "[Patch 1] 共清理 $fixedCount 个文件"
+
+      # ===================================================================
+      # 补丁 2：csproj 里 CopyOpenUtauAssets 这个Target本来只该给iOS用，
+      # 但没加条件限制，导致编译Android版时也去找iOS专用图标文件，
+      # 因为那些文件在仓库里没提交，直接编译报错。加上iOS专属条件。
+      # 顺带处理 RuntimeIdentifiers 精简到 arm64、去掉多余的windows平台判断行。
+      # ===================================================================
+      - name: Patch 2 - Fix csproj (iOS asset copy condition)
+        shell: pwsh
+        run: |
+          $projPath = $env:PROJ_PATH
+          $content  = Get-Content -Path $projPath -Raw
+
+          $content = $content -replace '(?m)^[^\r\n]*IsOSPlatform[^\r\n]*windows[^\r\n]*\r?\n', ''
+
+          if ($content -match 'android-arm;android-arm64') {
+            $content = $content -replace '<RuntimeIdentifiers>android-arm;android-arm64;android-x86;android-x64</RuntimeIdentifiers>',
+                                         '<RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>'
+          }
+
+          $old = '<Target Name="CopyOpenUtauAssets" AfterTargets="Build;Publish">'
+          $new = '<Target Name="CopyOpenUtauAssets" AfterTargets="Build;Publish" Condition="$([MSBuild]::GetTargetPlatformIdentifier(''$(TargetFramework)'')) == ''ios''">'
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Write-Host "[Patch 2] CopyOpenUtauAssets 已加 iOS 条件限制"
+          } else {
+            Write-Host "[Patch 2] 未发现需要修补的内容（可能已修过），跳过"
+          }
+
+          Set-Content -Path $projPath -Value $content -NoNewline
+
+      # ===================================================================
+      # 补丁 3：ObjectProvider.cs 里字体加载失败的兜底逻辑，过早调用了
+      # 还没初始化好的 DocManager.ExecuteCmd，导致启动阶段直接空引用崩溃，
+      # 并且会连带让后面所有初始化步骤（歌手管理器/DocManager本身等）全部
+      # 跳过没跑，造成"添加歌手卡死、新建工程闪退"等一连串问题。
+      # 这里直接删掉这一行过早的调用，只留日志记录 + 使用默认字体。
+      # ===================================================================
+      - name: Patch 3 - Fix startup crash in ObjectProvider.cs
+        shell: pwsh
+        run: |
+          if ($null -eq $env:OP_PATH) {
+            Write-Host "[Patch 3] 未找到 ObjectProvider.cs，跳过"
+          } else {
+            $path = $env:OP_PATH
+            $content = Get-Content -Path $path -Raw
+            $linePattern = '(?m)^[^\r\n]*DocManager\.Inst\.ExecuteCmd\(new ErrorMessageNotification\([^\r\n]*\)\);\r?\n'
+            if ($content -match $linePattern) {
+              $content = [regex]::Replace($content, $linePattern, '')
+              Set-Content -Path $path -Value $content -NoNewline
+              Write-Host "[Patch 3] 已删除过早调用 DocManager.ExecuteCmd 的那一行，修复启动崩溃"
+            } else {
+              Write-Host "[Patch 3] 未发现需要修补的内容（可能已修过），跳过"
+            }
+          }
+
+      # ===================================================================
+      # 补丁 4：DeepSeekService.cs 里 Preferences 类型和 MAUI 自带的
+      # Preferences 类同名冲突，加显式别名消除歧义；
+      # 同时把 ParseCommands 解析失败时直接抛异常，改成优雅兜底
+      # （当作纯文字消息处理，不再报错中断），避免AI回复格式稍有偏差
+      # 就直接报错、无法给用户任何有意义的反馈。
+      # ===================================================================
+      - name: Patch 4 - Fix DeepSeekService.cs (Preferences ambiguity + graceful JSON fallback)
+        shell: pwsh
+        run: |
+          if ($null -eq $env:DSS_PATH) {
+            Write-Host "[Patch 4] 未找到 DeepSeekService.cs，跳过"
+          } else {
+            $path = $env:DSS_PATH
+            $content = Get-Content -Path $path -Raw
+            $content = $content -replace "`r`n", "`n"
+            $changed = $false
+
+            # 4a. Preferences 别名
+            if ($content -match 'using OpenUtau\.Core\.Util;' -and $content -notmatch 'using Preferences = OpenUtau\.Core\.Util\.Preferences;') {
+              $content = $content -replace 'using OpenUtau\.Core\.Util;', "using OpenUtau.Core.Util;`nusing Preferences = OpenUtau.Core.Util.Preferences;"
+              Write-Host "[Patch 4a] 已添加 Preferences 别名"
+              $changed = $true
+            }
+
+            # 4b. ParseCommands 优雅降级（不再抛异常）
+            $oldLines = @(
+              '            try {',
+              '                return JsonSerializer.Deserialize<AiCommandRoot>(jsonText);',
+              '            } catch (Exception ex) {',
+              '                throw new FormatException($"AI 返回的不是有效指令 JSON：{reply}", ex);',
+              '            }'
+            )
+            $old = [string]::Join("`n", $oldLines)
+            if ($content.Contains($old)) {
+              $newLines = @(
+                '            try {',
+                '                var result = JsonSerializer.Deserialize<AiCommandRoot>(jsonText, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });',
+                '                if (result != null && result.Actions != null && result.Actions.Count > 0) {',
+                '                    return result;',
+                '                }',
+                '            } catch {',
+                '                // 解析失败时不再抛异常，走下面的兜底逻辑',
+                '            }',
+                '            return new AiCommandRoot {',
+                '                Actions = new System.Collections.Generic.List<AiCommandAction> {',
+                '                    new AiCommandAction { Type = "message" }',
+                '                },',
+                '                Message = reply',
+                '            };'
+              )
+              $new = [string]::Join("`n", $newLines)
+              $content = $content.Replace($old, $new)
+              Write-Host "[Patch 4b] ParseCommands 已改为优雅降级，不再抛异常"
+              $changed = $true
+            }
+
+            if ($changed) {
+              Set-Content -Path $path -Value $content -NoNewline
+            } else {
+              Write-Host "[Patch 4] 未发现需要修补的内容（可能已修过），跳过"
+            }
+          }
+
+      # ===================================================================
+      # 补丁 5：EditViewModel.cs 里 EditingPart.notes 实际类型是 SortedSet
+      # （自动排序集合），不支持 notes[索引] 这种下标访问方式，
+      # 之前AI改音符功能把它当成普通List来用了，编译直接报错。
+      # 统一替换成 .ElementAt(索引) 这种兼容写法。
+      # ===================================================================
+      - name: Patch 5 - Fix SortedSet indexing in EditViewModel.cs
+        shell: pwsh
+        run: |
+          if ($null -eq $env:EVM_PATH) {
+            Write-Host "[Patch 5] 未找到 EditViewModel.cs，跳过"
+          } else {
+            $path = $env:EVM_PATH
+            $content = Get-Content -Path $path -Raw
+            $pattern = 'EditingPart\.notes\[([^\]]+)\]'
+            $matches = [regex]::Matches($content, $pattern)
+            if ($matches.Count -gt 0) {
+              $content = [regex]::Replace($content, $pattern, 'EditingPart.notes.ElementAt($1)')
+              Set-Content -Path $path -Value $content -NoNewline
+              Write-Host "[Patch 5] 已修复 $($matches.Count) 处 SortedSet 下标访问"
+            } else {
+              Write-Host "[Patch 5] 未发现需要修补的内容（可能已修过），跳过"
+            }
+          }
+
+      # ===================================================================
+      # 补丁 6：EditViewModel.cs 里 ExecuteAiCommand 外层多包了一层
+      # StartUndoGroup/EndUndoGroup，跟每个具体操作自己内部那层嵌套冲突，
+      # 导致外层的 EndUndoGroup 执行时撤销组已经被内层提前结束，
+      # 触发渲染的通知因此丢失——AI加的音符能看见但不会被渲染成音频。
+      # 去掉外层这层包裹，并强制加一道校验+渲染兜底。
+      # ===================================================================
+      - name: Patch 6 - Fix AI note rendering (nested UndoGroup)
+        shell: pwsh
+        run: |
+          if ($null -eq $env:EVM_PATH) {
+            Write-Host "[Patch 6] 未找到 EditViewModel.cs，跳过"
+          } else {
+            $path = $env:EVM_PATH
+            $content = Get-Content -Path $path -Raw
+            $content = $content -replace "`r`n", "`n"
+
+            $oldLines = @(
+              '                var resultMessages = new System.Text.StringBuilder();',
+              '       DocManager.Inst.StartUndoGroup();',
+              '',
+              '                foreach (var action in root.Actions)',
+              '                {',
+              '                    string actionResult = await ExecuteSingleAction(action);',
+              '                    resultMessages.AppendLine(actionResult);',
+              '                }',
+              '',
+              '                DocManager.Inst.EndUndoGroup();'
+            )
+            $old = [string]::Join("`n", $oldLines)
+
+            if ($content.Contains($old)) {
+              $newLines = @(
+                '                var resultMessages = new System.Text.StringBuilder();',
+                '',
+                '                foreach (var action in root.Actions)',
+                '                {',
+                '                    string actionResult = await ExecuteSingleAction(action);',
+                '                    resultMessages.AppendLine(actionResult);',
+                '                }',
+                '',
+                '                // 每个 action 内部已自行管理 UndoGroup，这里不再重复包一层。',
+                '                DocManager.Inst.Project.ValidateFull();',
+                '                DocManager.Inst.ExecuteCmd(new global::OpenUtau.Core.PreRenderNotification());'
+              )
+              $new = [string]::Join("`n", $newLines)
+              $content = $content.Replace($old, $new)
+              Write-Host "[Patch 6] 已修复嵌套 UndoGroup 导致渲染丢失的问题"
+            } else {
+              Write-Host "[Patch 6] 未发现需要修补的内容（可能已修过或结构有变化），跳过"
+            }
+            Set-Content -Path $path -Value $content -NoNewline
+          }
+
+      # ===================================================================
+      # 补丁 7：给缺失的图标 SVG 文件补占位符（内容非空，避免图标光栅化
+      # 工具处理"空文档"时崩溃），确保编译不会因为找不到资源文件而失败。
+      # ===================================================================
+      - name: Patch 7 - Create missing SVG placeholders
+        shell: pwsh
+        run: |
+          $minSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="3" fill="#888888"/></svg>'
+          $allProjs = Get-ChildItem -Path . -Recurse -Filter "*.csproj"
+          foreach ($proj in $allProjs) {
+            $projContent = Get-Content -Path $proj.FullName -Raw
+            $projDir     = Split-Path -Parent $proj.FullName
+            $refs = [regex]::Matches($projContent, '(?:Include|ForegroundFile)="([^"]+\.svg)"')
+            foreach ($m in $refs) {
+              $rel = $m.Groups[1].Value
+              if ($rel -match '[*?]') { continue }
+              $full = Join-Path $projDir $rel
+              if (-not (Test-Path $full)) {
+                $dir = Split-Path -Parent $full
+                if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                Set-Content -Path $full -Value $minSvg -NoNewline
+              }
+            }
+          }
+          Write-Host "[Patch 7] 图标占位检查完成"
+
+      - name: Restore
+        run: dotnet restore "${{ env.PROJ_PATH }}"
+
+      - name: Build APK
+        shell: pwsh
+        run: |
+          dotnet build "${{ env.PROJ_PATH }}" -f net9.0-android -c Release *>&1 |
+            Tee-Object -FilePath build_log.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "构建失败，退出码 $LASTEXITCODE，完整日志见 build_log.txt 附件"
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload build log (always, even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_log.txt
+          if-no-files-found: warn
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenUtauMobile-apk
+          path: |
+            **/bin/**/*.apk
+            !**/obj/**
+          if-no-files-found: error
